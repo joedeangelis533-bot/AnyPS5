@@ -406,7 +406,7 @@ def audit_host_dependencies(direct, libraries, modules, windows=()):
                     raise AuditError(f"ambiguous Windows host library {name}: {', '.join(sorted(matches))}")
                 name = next(iter(matches), name)
                 chain[-1] = name
-            if name not in available:
+            if strip_origin(name) not in available:
                 missing.append({"importer": root, "chain": chain})
             elif name in direct and name not in expanded and name not in chain[1:-1]:
                 expanded.add(name)
@@ -557,8 +557,18 @@ class ModuleNames(set):
         return isinstance(library, str) and module_stem(library, self.fold) in self.stems
 
 
+def strip_origin(name):
+    """Strip the relinker's $ORIGIN/ prefix from a needed library name.
+
+    The relinker records converted modules' own dependencies as
+    `$ORIGIN/<file>` (GuestModuleBuilder), where `$ORIGIN` is the importing
+    module's directory. Matching must ignore that prefix.
+    """
+    return name[len("$ORIGIN/"):] if name.startswith("$ORIGIN/") else name
+
+
 def classify(nid, library, providers, stubs, modules):
-    if library and library in modules:
+    if library and strip_origin(library) in modules:
         return "module"
     if not providers:
         return "absent"
@@ -597,15 +607,15 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
     check_conservation(len(imports) + sum(len(symbols) for symbols, _ in (module_imports or {}).values()), ordered)
     missing = defaultdict(int)
     for library in needed_libraries:
-        if library not in libraries and library not in modules:
+        if library not in libraries and strip_origin(library) not in modules:
             missing[library] = 0
     for record in ordered:
         library = record["library"]
-        if library and library not in libraries and library not in modules:
+        if library and library not in libraries and strip_origin(library) not in modules:
             missing[library] += 1
     for _, needed in (module_imports or {}).values():
         for library in needed:
-            if library not in libraries and library not in modules:
+            if library not in libraries and strip_origin(library) not in modules:
                 missing[library] += 1
     return ordered, dict(sorted(missing.items()))
 
