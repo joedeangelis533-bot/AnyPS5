@@ -434,8 +434,8 @@ def audit_host_dependencies(direct, libraries, modules, windows=()):
         stack = [(name, [root, name]) for name in reversed(direct[root])]
         while stack:
             name, chain = stack.pop()
-            name = strip_origin(name)
-            if strip_origin(chain[-2]) in windows:
+            name = name.removeprefix("$ORIGIN/")
+            if chain[-2].removeprefix("$ORIGIN/") in windows:
                 matches = folded.get(name.lower(), ())
                 if len(matches) > 1:
                     raise AuditError(f"ambiguous Windows host library {name}: {', '.join(sorted(matches))}")
@@ -716,7 +716,7 @@ def check_conservation(references, records):
 
 
 def strip_origin(name):
-    return name[len("$ORIGIN/"):] if name.startswith("$ORIGIN/") else name
+    return name.rsplit("/", 1)[-1] if name.startswith("$ORIGIN/") else name
 
 
 MODULE_FILE_SUFFIXES = (".debug_prx", ".suprx", ".sprx", ".prx")
@@ -1016,8 +1016,15 @@ def main(argv=None):
         stubs, partial = source_stub_classes(args.source)
         records, missing = audit(imports, exports, stubs, libraries, modules, module_imports, module_exports, needed_libraries=needed, windows_libraries=windows, partial=partial)
         registry_library = host_library_resolver(windows)
-        registry_hosts = {path: [registry_library(strip_origin(name)) if windows else name for name in names]
-                          for path, names in registry_dependencies.items()}
+        registry_module_files = {name.lower() if windows else name for name in host_modules}
+        registry_hosts = {}
+        for path, names in registry_dependencies.items():
+            registry_hosts[path] = []
+            for name in names:
+                filename = strip_origin(name)
+                if (filename.lower() if windows else filename) in registry_module_files:
+                    name = filename
+                registry_hosts[path].append(registry_library(name.removeprefix("$ORIGIN/")) if windows else name)
         missing_hosts = audit_host_dependencies({**host_dependencies, **registry_hosts}, libraries, host_modules,
                                                 windows | set(registry_hosts) if windows else windows)
         if args.names:
