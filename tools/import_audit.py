@@ -406,7 +406,7 @@ def audit_host_dependencies(direct, libraries, modules, windows=()):
                     raise AuditError(f"ambiguous Windows host library {name}: {', '.join(sorted(matches))}")
                 name = next(iter(matches), name)
                 chain[-1] = name
-            if strip_origin(name) not in available:
+            if name.removeprefix("$ORIGIN/") not in available:
                 missing.append({"importer": root, "chain": chain})
             elif name in direct and name not in expanded and name not in chain[1:-1]:
                 expanded.add(name)
@@ -558,13 +558,7 @@ class ModuleNames(set):
 
 
 def strip_origin(name):
-    """Strip the relinker's $ORIGIN/ prefix from a needed library name.
-
-    The relinker records converted modules' own dependencies as
-    `$ORIGIN/<file>` (GuestModuleBuilder), where `$ORIGIN` is the importing
-    module's directory. Matching must ignore that prefix.
-    """
-    return name[len("$ORIGIN/"):] if name.startswith("$ORIGIN/") else name
+    return name.rsplit("/", 1)[-1] if name.startswith("$ORIGIN/") else name
 
 
 def classify(nid, library, providers, stubs, modules):

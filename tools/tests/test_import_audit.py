@@ -700,6 +700,108 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual((record["class"], record["library"]), ("module", "libSceFace.prx"))
         self.assertNotIn("libSceFace.prx", out)
 
+    def test_origin_module_dependencies_resolve_across_module_directories(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        consumer_dir = work.root / "app0" / "sce_module"
+        provider_dir = work.root / "app0" / "Media" / "Modules"
+        consumer_dir.mkdir(parents=True)
+        provider_dir.mkdir(parents=True)
+        provider = "Provider.prx.guest.prx"
+        (provider_dir / provider).write_bytes(exporting("AAAAAAAAAAA"))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        for dependency in (f"$ORIGIN/../Media/Modules/{provider}", f"$ORIGIN/../Media/./Modules/{provider}"):
+            with self.subTest(dependency=dependency):
+                (consumer_dir / "Consumer.prx.guest.prx").write_bytes(build_elf([
+                    ("AAAAAAAAAAA", 0, GLOBAL_FUNCTION)], [dependency]))
+                arguments = ("--modules", str(consumer_dir), "--json", str(report))
+                code, _, err = work.run(registry, *arguments, "--modules", str(provider_dir))
+                self.assertEqual((code, err), (0, ""))
+                data = json.loads(report.read_text())
+                self.assertEqual(data["missing_libraries"], {})
+                self.assertEqual((data["references"], data["unique_imports"]), (1, 1))
+                self.assertEqual(data["imports"][0]["providers"], [provider])
+                code, _, err = work.run(registry, *arguments)
+                self.assertEqual((code, err), (1, ""))
+                self.assertEqual(json.loads(report.read_text())["missing_libraries"], {dependency: 1})
+
+    def test_origin_needed_registry_resolves_nested_converted_module(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        directory = work.root / "app0" / "Media" / "Modules"
+        directory.mkdir(parents=True)
+        provider = directory / "Provider.prx.guest.prx"
+        provider.write_bytes(exporting())
+        registry, report = work.root / "game.registry.json", work.root / "audit.json"
+        dependency = "$ORIGIN/app0/Media/Modules/Provider.prx.guest.prx"
+        write_registry(registry, [])
+        (work.root / "game.needed.json").write_text(json.dumps([dependency]))
+        arguments = ("--modules", str(directory), "--json", str(report))
+        code, _, err = work.run(registry, *arguments)
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(report.read_text())
+        self.assertEqual(data["missing_libraries"], {})
+        self.assertEqual(data["needed_libraries"], [dependency])
+        self.assertEqual((data["references"], data["imports"]), (0, []))
+        provider.unlink()
+        code, out, err = work.run(registry, *arguments)
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(report.read_text())["missing_libraries"], {dependency: 0})
+        self.assertIn(dependency + ": 0 imports", out)
+
+    def test_origin_registry_imports_preserve_names_and_plain_path_matching(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "Provider.prx.guest.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        for library, expected in (("$ORIGIN/app0/Media/Modules/Provider.prx.guest.prx", "module"),
+                                  ("$ORIGIN/../Media/Modules/Provider.prx", "module"),
+                                  ("app0/Media/Modules/Provider.prx.guest.prx", "absent"),
+                                  ("$ORIGINAL/Provider.prx.guest.prx", "absent")):
+            with self.subTest(library=library):
+                write_registry(registry, [("AAAAAAAAAAA", library), ("AAAAAAAAAAA", library)])
+                code, _, err = work.run(registry, "--json", str(report))
+                self.assertEqual((code, err), (0 if expected == "module" else 1, ""))
+                data = json.loads(report.read_text())
+                self.assertEqual(data["missing_libraries"], {} if expected == "module" else {library: 1})
+                record, = data["imports"]
+                self.assertEqual((record["class"], record["library"], record["references"]), (expected, library, 2))
+
+    def test_origin_dependencies_retain_case_and_ambiguity_checks(self):
+        library = "$ORIGIN/app0/SDK-Shipping.debug_prx"
+        for fold in (False, True):
+            with self.subTest(fold=fold):
+                records, missing = import_audit.audit([("AAAAAAAAAAA", library, False)], {}, {}, set(),
+                                                     import_audit.ModuleNames({"sdk-shipping.prx"}, fold=fold))
+                self.assertEqual((records[0]["class"], missing),
+                                 ("module", {}) if fold else ("absent", {library: 1}))
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        other = work.root / "other-modules"
+        other.mkdir()
+        (work.modules / "Provider.prx.guest.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        (other / "Provider.prx.guest.prx").write_bytes(exporting("BBBBBBBBBBB"))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", "$ORIGIN/other-modules/Provider.prx.guest.prx")])
+        report.write_bytes(b"previous report")
+        code, out, err = work.run(registry, "--modules", str(other), "--json", str(report))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("ambiguous guest module", err)
+        self.assertEqual(report.read_bytes(), b"previous report")
+
+    def test_origin_host_dependencies_still_require_physical_filenames(self):
+        direct = {"host.prx": ["$ORIGIN/sub/Provider.prx", "$ORIGIN/Provider.prx"]}
+        modules = import_audit.ModuleNames({"Provider.prx.guest.prx", "Provider.prx"})
+        self.assertEqual(import_audit.audit_host_dependencies(direct, {"host.prx"}, modules), [
+            {"importer": "host.prx", "chain": ["host.prx", "$ORIGIN/sub/Provider.prx"]},
+        ])
+        modules = import_audit.ModuleNames({"Provider.prx.guest.prx"})
+        self.assertEqual(import_audit.audit_host_dependencies(direct, {"host.prx"}, modules), [
+            {"importer": "host.prx", "chain": ["host.prx", "$ORIGIN/Provider.prx"]},
+            {"importer": "host.prx", "chain": ["host.prx", "$ORIGIN/sub/Provider.prx"]},
+        ])
+
     def test_conflicting_module_files_preserve_or_leave_no_json_report(self):
         work = self.work
         first, second = work.modules, work.root / "other-modules"
