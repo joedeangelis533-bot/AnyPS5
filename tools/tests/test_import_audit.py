@@ -23,7 +23,7 @@ MESSAGE_NID = "wTpfglkmv34"
 MESSAGE_NAME = "sceMsgDialogProgressBarSetValue"
 
 
-def build_elf(symbols, needed=()):
+def build_elf(symbols, needed=(), module_names=()):
     strings = b"\0"
     entries = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
     for name, index, info in symbols:
@@ -33,12 +33,16 @@ def build_elf(symbols, needed=()):
     for library in needed:
         libraries.append(len(strings))
         strings += library.encode() + b"\0"
+    names = []
+    for tag, name in module_names:
+        names.append((tag, len(strings) | (0x10100000000 if tag != 14 else 0)))
+        strings += name.encode() + b"\0"
     table = b"".join(entries)
     table_offset = 64 + len(strings)
     table_offset += -table_offset % 8
     dynamic_offset = table_offset + len(table)
     dynamic_offset += -dynamic_offset % 8
-    pairs = [(1, offset) for offset in libraries]
+    pairs = [(1, offset) for offset in libraries] + names
     if pairs:
         pairs.append((0, 0))
     dynamic = b"".join(struct.pack("<qQ", tag, value) for tag, value in pairs)
@@ -56,7 +60,7 @@ def build_elf(symbols, needed=()):
     return bytes(image)
 
 
-def build_sectionless_elf(symbols, needed=(), gnu_hash=False):
+def build_sectionless_elf(symbols, needed=(), gnu_hash=False, module_names=()):
     strings = b"\0"
     entries = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
     for name, index, info in symbols:
@@ -66,6 +70,10 @@ def build_sectionless_elf(symbols, needed=(), gnu_hash=False):
     for library in needed:
         libraries.append(len(strings))
         strings += library.encode() + b"\0"
+    names = []
+    for tag, name in module_names:
+        names.append((tag, len(strings) | (0x10100000000 if tag != 14 else 0)))
+        strings += name.encode() + b"\0"
     program_offset = 64
     content_offset = program_offset + 2 * 56
     strings_offset = content_offset
@@ -81,6 +89,7 @@ def build_sectionless_elf(symbols, needed=(), gnu_hash=False):
         hash_tag = 4
     dynamic_offset = (hash_offset + len(hash_table) + 7) & ~7
     dynamic = b"".join(struct.pack("<qQ", 1, value) for value in libraries)
+    dynamic += b"".join(struct.pack("<qQ", tag, value) for tag, value in names)
     dynamic += b"".join(struct.pack("<qQ", tag, value) for tag, value in (
         (5, 0x400000 + strings_offset),
         (10, len(strings)),
@@ -739,6 +748,31 @@ class ImportAuditTests(unittest.TestCase):
         record = next(record for record in data["imports"] if record["library"] == "shipping.debug_prx")
         self.assertEqual(record["class"], "module")
 
+    def test_module_suffix_aliases_require_suffixes_on_both_filenames(self):
+        work = self.work
+        registry, report = work.root / "game.registry.json", work.root / "audit.json"
+        cases = (("shipping.prx", "shipping"), ("shipping", "shipping.prx"),
+                 ("shipping.data", "shipping.data.prx"), (".prx", ".sprx"))
+        for windows in (False, True):
+            (work.libs / "libc.prx").write_bytes(build_pe([]) if windows else exporting())
+            for filename, alias in cases:
+                module = work.modules / filename
+                module.write_bytes(exporting("AAAAAAAAAAA"))
+                try:
+                    for needed in (filename, alias):
+                        with self.subTest(windows=windows, filename=filename, needed=needed):
+                            write_registry(registry, [("AAAAAAAAAAA", needed)])
+                            import_audit.needed_registry_path(registry).write_text(json.dumps([needed]), encoding="utf-8")
+                            code, _, err = work.run(registry, "--json", str(report))
+                            exact = needed == filename
+                            self.assertEqual((code, err), (0 if exact else 1, ""))
+                            data = json.loads(report.read_text(encoding="utf-8"))
+                            self.assertEqual(data["missing_libraries"], {} if exact else {needed: 1})
+                            self.assertEqual(data["imports"][0]["class"], "module" if exact else "absent")
+                            self.assertEqual(data["references"], 1)
+                finally:
+                    module.unlink()
+
     def test_module_names_ignore_case_for_windows_output_only(self):
         imports = [("AAAAAAAAAAA", "SDK-Shipping.debug_prx", False)]
         records, missing = import_audit.audit(imports, {}, {}, set(), import_audit.ModuleNames({"sdk-shipping.prx"}, fold=True))
@@ -760,7 +794,7 @@ class ImportAuditTests(unittest.TestCase):
                 module.write_bytes(exporting("AAAAAAAAAAA"))
                 try:
                     write_registry(registry, [("AAAAAAAAAAA", needed)])
-                    import_audit.needed_registry_path(registry).write_text(json.dumps([needed]), encoding="utf-8")
+                    import_audit.needed_registry_path(registry).write_text("[]", encoding="utf-8")
                     code, _, err = work.run(registry, "--json", str(report), "--strict-providers")
                     self.assertEqual((code, err), (0, ""))
                     data = json.loads(report.read_text(encoding="utf-8"))
@@ -878,6 +912,278 @@ class ImportAuditTests(unittest.TestCase):
         self.assertNotIn("libSceGone.prx is in", out)
         code, out, err = work.run(registry, "--modules", str(elsewhere))
         self.assertNotIn("libSceMissing.prx is in", out)
+
+    def test_converted_module_resolves_plain_and_origin_library_names(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "libSceFace.prx.guest.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        (work.modules / "main.prx").write_bytes(build_elf([], ["$ORIGIN/libSceFace.prx.guest.prx"]))
+        registry = work.root / "game.registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceFace.prx")])
+        (work.root / "game.needed.json").write_text('["libSceFace.prx"]')
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["missing_libraries"], {})
+        self.assertEqual(data["unique_by_class"]["module"], 1)
+        record = next(record for record in data["imports"] if record["nid"] == "AAAAAAAAAAA")
+        self.assertEqual((record["class"], record["library"]), ("module", "libSceFace.prx"))
+        self.assertNotIn("libSceFace.prx", out)
+
+    def test_declared_module_names_resolve_imports_and_dependencies(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting("CCCCCCCCCCC"))
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        for format in ("sections", "sysv", "gnu", "out_of_file_sysv", "out_of_file_gnu"):
+            for tag in (14, 0x6100000d, 0x61000043):
+                suffixes = ("",) if tag == 14 else ("", ".prx", ".sprx", ".suprx", ".debug_prx")
+                for suffix in suffixes:
+                    with self.subTest(format=format, tag=hex(tag), suffix=suffix):
+                        alias = "Declared.prx" if tag == 14 else "Declared" + suffix
+                        name = "Declared.prx" if tag == 14 else "Declared"
+                        provider = [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION), ("CCCCCCCCCCC", 0, GLOBAL_FUNCTION)]
+                        consumer = [("AAAAAAAAAAA", 0, GLOBAL_FUNCTION)]
+                        if format == "sections":
+                            image = build_elf(provider, module_names=[(tag, name)])
+                            dependency = build_elf(consumer, [alias])
+                        else:
+                            image = build_sectionless_elf(provider, gnu_hash=format.endswith("gnu"), module_names=[(tag, name)])
+                            dependency = build_sectionless_elf(consumer, [alias], gnu_hash=format.endswith("gnu"))
+                            if format.startswith("out_of_file"):
+                                image, dependency = bytearray(image), bytearray(dependency)
+                                for module in (image, dependency):
+                                    struct.pack_into("<Q", module, 40, len(module) + 64)
+                                    struct.pack_into("<H", module, 60, 38)
+                        (work.modules / "Different.prx").write_bytes(image)
+                        (work.modules / "consumer.prx").write_bytes(dependency)
+                        write_registry(registry, [("AAAAAAAAAAA", alias), ("AAAAAAAAAAA", "Different.prx")])
+                        (work.root / "game.needed.json").write_text("[]")
+                        code, _, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, err), (0, ""))
+                        data = json.loads(result.read_text())
+                        self.assertEqual(data["missing_libraries"], {})
+                        self.assertEqual(data["references"], 4)
+                        self.assertEqual(data["unique_by_class"], {"implemented": 2, "partial": 0, "stub": 0, "absent": 0, "module": 2})
+                        self.assertIsNone(data["stops"][0]["nid"])
+
+    def test_needed_registry_requires_filenames_not_declared_module_aliases(self):
+        work = self.work
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        needed = import_audit.needed_registry_path(registry)
+        for windows in (False, True):
+            (work.libs / "libc.prx").write_bytes(build_pe([]) if windows else build_elf([]))
+            for tag in (14, 0x6100000d, 0x61000043):
+                for prefix in ("", "$ORIGIN/"):
+                    with self.subTest(windows=windows, tag=hex(tag), prefix=prefix):
+                        alias = "Declared.prx" if tag == 14 else "Declared"
+                        (work.modules / "Provider.prx").write_bytes(build_elf(
+                            [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], module_names=[(tag, alias)]))
+                        write_registry(registry, [("AAAAAAAAAAA", "Declared.prx")])
+                        missing = prefix + "Declared.prx"
+                        needed.write_text(json.dumps([missing, missing]), encoding="utf-8")
+                        code, _, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, err), (1, ""))
+                        data = json.loads(result.read_text())
+                        self.assertEqual(data["imports"][0]["class"], "module")
+                        self.assertEqual(data["missing_host_dependencies"], [
+                            {"importer": str(needed), "chain": [str(needed), "Declared.prx" if windows else missing]}])
+                        for resolved in ([], [prefix + "Provider.prx"]):
+                            needed.write_text(json.dumps(resolved), encoding="utf-8")
+                            self.assertEqual(work.run(registry)[0], 0)
+
+    def test_host_dependencies_require_filenames_not_module_identities(self):
+        work = self.work
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", "Declared.prx")])
+        for format in ("elf", "pe"):
+            for tag in (14, 0x6100000d, 0x61000043):
+                with self.subTest(format=format, tag=hex(tag)):
+                    host = (build_elf([], ["Declared.prx"]) if format == "elf"
+                            else build_pe_with_imports(["Declared.prx"], []))
+                    (work.libs / "host.prx").write_bytes(host)
+                    name = "Declared.prx" if tag == 14 else "Declared"
+                    (work.modules / "Different.prx").write_bytes(build_elf(
+                        [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], module_names=[(tag, name)]))
+                    code, _, err = work.run(registry, "--json", str(result))
+                    self.assertEqual((code, err), (1, ""))
+                    data = json.loads(result.read_text())
+                    self.assertEqual(data["missing_libraries"], {})
+                    self.assertEqual(data["unique_by_class"]["absent"], 0)
+                    self.assertEqual(data["unique_by_class"]["module"], 1)
+                    self.assertEqual(data["missing_host_dependencies"], [
+                        {"importer": "host.prx", "chain": ["host.prx", "Declared.prx"]}])
+                    exact = work.modules / "Declared.prx"
+                    (work.modules / "Different.prx").rename(exact)
+                    code, _, err = work.run(registry, "--json", str(result))
+                    self.assertEqual((code, err), (0, ""))
+                    data = json.loads(result.read_text())
+                    self.assertEqual(data["missing_host_dependencies"], [])
+                    self.assertEqual(data["missing_libraries"], {})
+                    exact.unlink()
+
+    def test_module_identity_does_not_fold_undeclared_filename_case(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "Provider.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", "provider.prx")])
+        code, _, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["missing_libraries"], {"provider.prx": 1})
+        self.assertEqual(data["imports"][0]["class"], "absent")
+
+    def test_ambiguous_module_names_preserve_report(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        previous = b'{"previous":"complete report"}\n'
+        for tag in (14, 0x6100000d, 0x61000043):
+            with self.subTest(tag=hex(tag)):
+                name = "Declared.prx" if tag == 14 else "Declared"
+                for file in ("first.prx", "second.prx"):
+                    (work.modules / file).write_bytes(build_elf([], module_names=[(tag, name)]))
+                write_registry(registry, [("AAAAAAAAAAA", "Declared.prx")])
+                result.write_bytes(previous)
+                code, out, err = work.run(registry, "--json", str(result))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("ambiguous guest module", err)
+                self.assertEqual(result.read_bytes(), previous)
+
+    def test_exact_module_filename_precedes_other_module_identities(self):
+        work = self.work
+        (work.modules / "Declared.prx").write_bytes(exporting())
+        for file in ("first.prx", "second.prx"):
+            (work.modules / file).write_bytes(build_elf([], module_names=[(0x61000043, "Declared")]))
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        for windows in (False, True):
+            (work.libs / "libc.prx").write_bytes(build_pe([]) if windows else exporting())
+            for suffix in (".prx", ".sprx", ".suprx", ".debug_prx"):
+                requested = ["Declared" + suffix]
+                if windows:
+                    requested += ["declared" + suffix, "DECLARED" + suffix.upper()]
+                for name in requested:
+                    with self.subTest(windows=windows, name=name):
+                        write_registry(registry, [("AAAAAAAAAAA", name)])
+                        import_audit.needed_registry_path(registry).write_text("[]", encoding="utf-8")
+                        code, _, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, err), (0, ""))
+                        data = json.loads(result.read_text())
+                        self.assertEqual(data["missing_libraries"], {})
+                        self.assertEqual(data["references"], 1)
+                        self.assertEqual(data["imports"][0]["class"], "module")
+
+    def test_declared_aliases_do_not_inherit_windows_filename_matching(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(build_pe([]))
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        for tag in (14, 0x6100000d, 0x61000043):
+            declared = "Declared.prx" if tag == 14 else "Declared"
+            (work.modules / "Provider.prx").write_bytes(build_elf(
+                [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], module_names=[(tag, declared)]))
+            invalid = ["declared.prx"] + (["Declared.sprx"] if tag == 14 else [])
+            for bad in invalid:
+                for requested in ([bad], ["Declared.prx", bad], [bad, "Declared.prx"]):
+                    with self.subTest(tag=hex(tag), requested=requested):
+                        write_registry(registry, [("AAAAAAAAAAA", name) for name in requested])
+                        import_audit.needed_registry_path(registry).write_text(json.dumps(requested), encoding="utf-8")
+                        code, _, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, err), (1, ""))
+                        data = json.loads(result.read_text())
+                        self.assertEqual(data["references"], len(requested))
+                        self.assertEqual(data["missing_libraries"], {bad: 1})
+                        self.assertEqual({entry["library"]: entry["class"] for entry in data["imports"]},
+                                         {name: "absent" if name == bad else "module" for name in requested})
+
+    def test_origin_prefixed_declared_aliases_keep_exact_case(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(build_pe([]))
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        for tag in (14, 0x6100000d, 0x61000043):
+            declared = "Declared.prx" if tag == 14 else "Declared"
+            (work.modules / "Provider.prx").write_bytes(build_elf(
+                [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)], module_names=[(tag, declared)]))
+            for alias, expected in (("Declared.prx", 0), ("declared.prx", 1)):
+                with self.subTest(tag=hex(tag), alias=alias):
+                    needed = "$ORIGIN/" + alias
+                    write_registry(registry, [("AAAAAAAAAAA", needed)])
+                    import_audit.needed_registry_path(registry).write_text(json.dumps([] if expected == 0 else [needed]), encoding="utf-8")
+                    code, _, err = work.run(registry, "--json", str(result))
+                    self.assertEqual((code, err), (expected, ""))
+                    data = json.loads(result.read_text())
+                    self.assertEqual(data["references"], 1)
+                    self.assertEqual(data["missing_libraries"], {needed: 1} if expected else {})
+                    self.assertEqual(data["imports"][0]["class"], "absent" if expected else "module")
+
+    def test_origin_host_dependency_retains_transitive_chains(self):
+        direct = {"host.prx": ["$ORIGIN/Provider.prx"], "Provider.prx": ["Missing.prx"]}
+        expected = [
+            {"importer": "Provider.prx", "chain": ["Provider.prx", "Missing.prx"]},
+            {"importer": "host.prx", "chain": ["host.prx", "$ORIGIN/Provider.prx", "Missing.prx"]},
+        ]
+        self.assertEqual(import_audit.audit_host_dependencies(direct, set(direct), set()), expected)
+        direct = {"host.prx": ["$ORIGIN/PROVIDER.PRX"], "Provider.prx": ["Missing.prx"]}
+        expected[1]["chain"][1] = "Provider.prx"
+        self.assertEqual(import_audit.audit_host_dependencies(direct, set(direct), set(), windows={"host.prx"}), expected)
+        direct = {"host.prx": ["$ORIGIN/Provider.prx"], "Provider.prx": ["leaf.prx"]}
+        self.assertEqual(import_audit.audit_host_dependencies(
+            direct, {*direct, "Leaf.prx"}, set(), windows={"Provider.prx"}), [])
+
+    def test_origin_prefix_keeps_filename_suffix_boundaries(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(build_pe([]))
+        (work.modules / "Shipping.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry, result = work.root / "game.registry.json", work.root / "audit.json"
+        for name, expected in (("Shipping.sprx", 0), ("shipping.SUPRX", 0), ("Shipping", 1)):
+            with self.subTest(name=name):
+                needed = "$ORIGIN/" + name
+                write_registry(registry, [("AAAAAAAAAAA", needed)])
+                import_audit.needed_registry_path(registry).write_text(json.dumps([] if expected == 0 else [needed]), encoding="utf-8")
+                code, _, err = work.run(registry, "--json", str(result))
+                self.assertEqual((code, err), (expected, ""))
+                data = json.loads(result.read_text())
+                self.assertEqual(data["missing_libraries"], {needed: 1} if expected else {})
+                self.assertEqual(data["imports"][0]["class"], "absent" if expected else "module")
+
+    def test_multiple_module_names_and_identical_files_do_not_repeat_imports(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting("CCCCCCCCCCC"))
+        other = work.root / "other-modules"
+        other.mkdir()
+        image = build_elf([("CCCCCCCCCCC", 0, GLOBAL_FUNCTION)], module_names=[
+            (14, "Declared.prx"), (0x6100000d, "Original"), (0x61000043, "Alternate")])
+        for directory in (work.modules, other):
+            (directory / "provider.prx").write_bytes(image)
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [("AAAAAAAAAAA", name) for name in ("Declared.prx", "Original.prx", "Alternate.sprx")])
+        code, _, err = work.run(registry, "--modules", str(other), "--strict-providers", "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["references"], 4)
+        self.assertEqual(data["unique_by_class"], {"implemented": 1, "partial": 0, "stub": 0, "absent": 0, "module": 3})
+
+    def test_invalid_declared_module_name_preserves_report(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        previous = b'{"previous":"complete report"}\n'
+        for format in ("sections", "sysv", "gnu"):
+            for tag in (14, 0x6100000d, 0x61000043):
+                for name in ("", "bad\\name"):
+                    with self.subTest(format=format, tag=hex(tag), name=name):
+                        symbols = [("AAAAAAAAAAA", 1, GLOBAL_FUNCTION)]
+                        if format == "sections":
+                            image = build_elf(symbols, module_names=[(tag, name)])
+                        else:
+                            image = build_sectionless_elf(symbols, gnu_hash=format == "gnu", module_names=[(tag, name)])
+                        (work.modules / "provider.prx").write_bytes(image)
+                        result.write_bytes(previous)
+                        code, out, err = work.run(registry, "--json", str(result))
+                        self.assertEqual((code, out), (2, ""))
+                        self.assertIn("invalid module name", err)
+                        self.assertEqual(result.read_bytes(), previous)
 
     def test_conflicting_module_files_preserve_or_leave_no_json_report(self):
         work = self.work
@@ -1768,8 +2074,9 @@ class ImportAuditTests(unittest.TestCase):
         module = self.work.modules / "libc.prx.guest.prx"
         module.write_bytes(build_pe(["sceKernelGettimeofday#guest", "sceKernelSleep"]))
 
-        imports, exports = import_audit.read_modules([self.work.modules])
+        imports, exports, modules = import_audit.read_modules([self.work.modules])
 
+        self.assertEqual(modules, {module.name})
         self.assertEqual(imports, {module.name: ([], [])})
         self.assertEqual(exports, {
             "sceKernelGettimeofday": [module.name],

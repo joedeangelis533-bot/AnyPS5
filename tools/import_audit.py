@@ -16,6 +16,7 @@ import progress
 ROOT = Path(__file__).resolve().parent.parent
 PRX = ROOT / "core" / "libs" / "prx"
 MODULE_SUFFIX = "#"
+MODULE_EXTENSIONS = (".prx", ".sprx", ".suprx", ".debug_prx")
 CLASSES = ("implemented", "partial", "stub", "absent", "module")
 CONDITIONAL = re.compile(r"(?:if|else|for|while|do|switch|case|default|try|catch|co_await|co_yield)\b")
 BRANCHING = re.compile(r"\?|&&|\|\||\b(?:and|or)\b")
@@ -64,7 +65,18 @@ def elf_sections(path, data):
     return [unpack("<IIQQQQIIQQ", data, section_offset + index * 64, path, f"section header {index}") for index in range(section_count)]
 
 
-def elf_program_dynamic_symbols(path, data):
+def add_module_name(path, data, offset, size, tag, value, names):
+    if names is None or tag not in (14, 0x6100000d, 0x61000043):
+        return
+    position = value if tag == 14 else value & 0xffffffff
+    name = cstring(data, offset + position, offset + size, path, "module name")
+    forbidden = "\\:$\r\n" if tag == 14 else "/\\:$\r\n"
+    if not name or any(character in name for character in forbidden):
+        raise AuditError(f"{path}: invalid module name {name!r}")
+    names["sonames" if tag == 14 else "identities"].add(name)
+
+
+def elf_program_dynamic_symbols(path, data, module_names=None):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
     ident, program_offset, program_size, program_count = header[0], header[5], header[9], header[10]
     if ident[6] != 1 or header[3] != 1:
@@ -93,6 +105,7 @@ def elf_program_dynamic_symbols(path, data):
     dynamic = {}
     needed_offsets = []
     terminated = False
+    named_entries = []
     for position in range(0, dynamic_size, 16):
         tag, value = unpack("<qQ", data, dynamic_offset + position, path, "dynamic entry")
         if tag == 0:
@@ -102,6 +115,8 @@ def elf_program_dynamic_symbols(path, data):
             needed_offsets.append(value)
         else:
             dynamic[tag] = value
+        if tag in (14, 0x6100000d, 0x61000043):
+            named_entries.append((tag, value))
     if not terminated:
         raise AuditError(f"{path}: dynamic segment is not terminated by DT_NULL")
     string_address = dynamic.get(5)
@@ -111,6 +126,8 @@ def elf_program_dynamic_symbols(path, data):
     if None in (string_address, string_size, symbol_address, symbol_size) or symbol_size != 24 or string_size == 0:
         raise AuditError(f"{path}: incomplete dynamic string or symbol table")
     string_offset = file_offset(string_address, string_size, "dynamic string table")
+    for tag, value in named_entries:
+        add_module_name(path, data, string_offset, string_size, tag, value, module_names)
 
     symbol_count = None
     if 4 in dynamic:
@@ -194,10 +211,10 @@ def elf_exports(path, data):
     return names
 
 
-def elf_imports(path, data):
+def elf_imports(path, data, module_names=None):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
     if not header[6] or header[6] >= len(data):
-        imports, _, needed = elf_program_dynamic_symbols(path, data)
+        imports, _, needed = elf_program_dynamic_symbols(path, data, module_names)
         return imports, needed
     sections = elf_sections(path, data)
     symbols = {}
@@ -228,6 +245,7 @@ def elf_imports(path, data):
                     break
                 if tag == 1:
                     needed.add(cstring(data, strings_offset + value, strings_offset + strings_size, path, "needed library name"))
+                add_module_name(path, data, strings_offset, strings_size, tag, value, module_names)
             if not terminated:
                 raise AuditError(f"{path}: dynamic section is not terminated by DT_NULL")
     return symbols, needed
@@ -416,7 +434,8 @@ def audit_host_dependencies(direct, libraries, modules, windows=()):
         stack = [(name, [root, name]) for name in reversed(direct[root])]
         while stack:
             name, chain = stack.pop()
-            if chain[-2] in windows:
+            name = strip_origin(name)
+            if strip_origin(chain[-2]) in windows:
                 matches = folded.get(name.lower(), ())
                 if len(matches) > 1:
                     raise AuditError(f"ambiguous Windows host library {name}: {', '.join(sorted(matches))}")
@@ -445,10 +464,12 @@ def module_files(directory):
             raise AuditError(f"{file}: expected ELF module (first bytes {magic!r})")
 
 
-def read_modules(directories):
+def read_modules(directories, needed_names=(), *, windows=False):
     imports = {}
     exports = defaultdict(set)
     images = {}
+    aliases = {}
+    identities = defaultdict(set)
     for directory in directories:
         for file in module_files(directory):
             data = file.read_bytes()
@@ -459,16 +480,38 @@ def read_modules(directories):
                     raise AuditError(f"ambiguous guest module {file.name}: {previous} and {file} have different contents")
                 continue
             images[file.name] = (file, digest)
+            names = {"sonames": set(), "identities": set()}
             if data.startswith(b"MZ"):
                 imports[file.name] = ([], [])
-                names = pe_exports(file, data)
+                exported = pe_exports(file, data)
             else:
-                symbols, needed = elf_imports(file, data)
+                symbols, needed = elf_imports(file, data, names)
                 imports[file.name] = (sorted(symbols.items()), sorted(needed))
-                names = elf_exports(file, data)
-            for name in names:
+                exported = elf_exports(file, data)
+            for name in {file.name} | names["sonames"]:
+                if name in aliases and aliases[name] != file:
+                    raise AuditError(f"ambiguous guest module name {name}: {aliases[name]} and {file}")
+                aliases[name] = file
+            for name in names["identities"]:
+                identities[name].add(file)
+            for name in exported:
                 exports[name.split(MODULE_SUFFIX, 1)[0]].add(file.name)
-    return imports, {name: sorted(files) for name, files in exports.items()}
+    requested = set(needed_names) | {name for _, needed in imports.values() for name in needed}
+    filenames = ModuleNames(images, fold=windows)
+    folded_files = {name.lower() for name in images} if windows else set()
+    for name in sorted({strip_origin(name) for name in requested}):
+        normalized = name.lower() if windows else name
+        file_suffix = any(len(normalized) > len(extension) and normalized.endswith(extension) for extension in MODULE_EXTENSIONS)
+        if name in aliases or normalized in folded_files or (file_suffix and name in filenames):
+            continue
+        suffix = next((extension for extension in MODULE_EXTENSIONS if name.endswith(extension)), "")
+        stem = name[:-len(suffix)] if suffix else name
+        providers = identities.get(name, set()) | identities.get(stem, set())
+        if len(providers) > 1:
+            raise AuditError(f"ambiguous guest module identity {name}: " + ", ".join(str(file) for file in sorted(providers)))
+        if providers:
+            aliases[name] = next(iter(providers))
+    return imports, {name: sorted(files) for name, files in exports.items()}, ModuleNames(images, fold=windows, exact=aliases)
 
 
 def nids_of(name, aliases):
@@ -672,6 +715,10 @@ def check_conservation(references, records):
         raise AuditError(f"conservation failed: {references} references in, {classified} classified, unknown classes {unknown}")
 
 
+def strip_origin(name):
+    return name[len("$ORIGIN/"):] if name.startswith("$ORIGIN/") else name
+
+
 MODULE_FILE_SUFFIXES = (".debug_prx", ".suprx", ".sprx", ".prx")
 
 
@@ -680,22 +727,28 @@ def module_stem(name, fold):
         name = name.lower()
     for suffix in MODULE_FILE_SUFFIXES:
         if len(name) > len(suffix) and name.endswith(suffix):
-            name = name[:-len(suffix)]
-            break
-    return name
+            return name[:-len(suffix)]
+    return None
 
 
 class ModuleNames(set):
     """Title module names, matched like the relinker: by the name without its .prx, .sprx, .suprx or .debug_prx suffix, and
     ignoring case for Windows output."""
 
-    def __init__(self, names=(), fold=False):
-        super().__init__(names)
+    def __init__(self, names=(), fold=False, *, exact=()):
+        names, exact = set(names), set(exact)
+        super().__init__(names | exact)
         self.fold = fold
-        self.stems = {module_stem(name, fold) for name in self}
+        self.exact = exact
+        self.files = {name.lower() if fold else name for name in names}
+        self.stems = {stem for name in names if (stem := module_stem(name, fold)) is not None}
 
     def __contains__(self, library):
-        return isinstance(library, str) and module_stem(library, self.fold) in self.stems
+        if not isinstance(library, str):
+            return False
+        library = strip_origin(library)
+        filename = library.lower() if self.fold else library
+        return library in self.exact or filename in self.files or module_stem(library, self.fold) in self.stems
 
 
 def classify(nid, library, providers, stubs, modules, partial=frozenset()):
@@ -708,7 +761,7 @@ def classify(nid, library, providers, stubs, modules, partial=frozenset()):
     return "implemented"
 
 
-def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None, *, needed_libraries=(), windows_libraries=(), partial=frozenset()):
+def host_library_resolver(windows_libraries):
     windows_names = {}
     for library in windows_libraries:
         windows_names.setdefault(library.casefold(), set()).add(library)
@@ -724,6 +777,12 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
                     if len(candidates) == 1:
                         return next(iter(candidates))
         return name
+
+    return system_library
+
+
+def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None, *, needed_libraries=(), windows_libraries=(), partial=frozenset()):
+    system_library = host_library_resolver(windows_libraries)
 
     def available(name):
         return name in modules or system_library(name) in libraries
@@ -946,16 +1005,21 @@ def main(argv=None):
                 raise AuditError(f"{args.json}: JSON output would overwrite an input file")
         registries = [(registry, read_registry(registry)) for registry in args.registries]
         imports = [entry for _, entries in registries for entry in entries]
-        needed = sorted({library for path in dependency_registries for library in read_needed_registry(path)})
+        registry_dependencies = {str(path): sorted(set(read_needed_registry(path))) for path in dependency_registries}
+        needed = sorted({library for libraries in registry_dependencies.values() for library in libraries})
         exports, libraries = built_libraries(args.libs)
         host_dependencies, windows = built_host_dependencies(args.libs)
-        module_imports, module_exports = read_modules(args.modules)
-        modules = set(module_imports)
-        modules |= {name.removesuffix(".guest.prx") for name in modules if name.endswith(".guest.prx")}
-        modules = ModuleNames(modules, fold=bool(windows))
+        module_imports, module_exports, modules = read_modules(args.modules, set(needed) | {library for _, library, _ in imports if library}, windows=bool(windows))
+        host_modules = set(module_imports)
+        host_modules |= {name.removesuffix(".guest.prx") for name in host_modules if name.endswith(".guest.prx")}
+        modules = ModuleNames(host_modules, fold=bool(windows), exact=modules.exact)
         stubs, partial = source_stub_classes(args.source)
         records, missing = audit(imports, exports, stubs, libraries, modules, module_imports, module_exports, needed_libraries=needed, windows_libraries=windows, partial=partial)
-        missing_hosts = audit_host_dependencies(host_dependencies, libraries, modules, windows)
+        registry_library = host_library_resolver(windows)
+        registry_hosts = {path: [registry_library(strip_origin(name)) if windows else name for name in names]
+                          for path, names in registry_dependencies.items()}
+        missing_hosts = audit_host_dependencies({**host_dependencies, **registry_hosts}, libraries, host_modules,
+                                                windows | set(registry_hosts) if windows else windows)
         if args.names:
             attach_names(records, load_names(args.names))
         summary = summarize(records, sum(record["references"] for record in records), missing, missing_hosts)
