@@ -55,6 +55,22 @@ Titles run natively, so the host CPU needs the extensions of the PS5's Zen 2 CPU
 
 The executable, registry, Windows import diagnostics, icon and desktop entry output files must not refer to the input executable or a bundled module being converted, including through a hard link or symbolic link. These collisions fail before any output is written. An existing output file can be replaced if it is separate from those inputs.
 
+## Inspect a USB copy or game folder
+
+`python3 tools/inspect_ps5_copy.py <path>` inspects a readable folder or regular file without executing, extracting, decrypting, converting, mounting or writing source data. It needs only Python 3. It reports executable candidates, SELF containers needing further validation, module directory conflicts, declared dependencies, selected unverified `sce_sys/param.json` metadata and inspection errors. A dependency not observed beside the executable may be supplied by the AnyPS5 host runtime; it is not automatically a missing game file. Use `tools/import_audit.py` to examine imports once readable ELF inputs are available.
+
+```sh
+python3 tools/inspect_ps5_copy.py /path/to/game
+python3 tools/inspect_ps5_copy.py /path/to/backup --format json
+python3 tools/inspect_ps5_copy.py /path/to/disk.img --format json
+```
+
+Folders are bounded by 10,000 entries, depth 16 and 64 MiB of total reads by default. Adjust these with `--max-entries`, `--max-depth` and `--max-read-mib`. Symlinks, Windows reparse points and non-regular files are skipped and reported; access errors or limits make inspection incomplete. Keep the source stable during inspection. Output goes to stdout; save reports outside the inspected source.
+
+An explicit `--device` accepts a block device, including `\\.\PhysicalDriveN` on Windows, and reads only its first 8192 bytes. Device permissions may be required. It does not mount the drive or traverse its filesystem. Regular image and archive files are also identified by header only; boot-sector and GPT signatures do not validate a filesystem or establish PS5 origin. An opaque console backup cannot establish whether executable files are absent or encrypted. Do not initialize or format a console drive when connecting it to a PC.
+
+Exit `0` means an executable candidate passed limited header/dependency checks and has an observed standard module layout; it does not certify decryption, complete assets, relinker acceptance or playability. Exit `1` reports observed blockers or no candidate. Exit `2` reports an error or incomplete inspection, including an opaque single-file or device header inspection. The text and JSON reports retain unknowns separately from observed blockers. The inspector performs no writes; the operating system may still update access metadata or write to mounted volumes independently.
+
 ## Options
 
 All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath` defaults to `$ORIGIN/libs`.
